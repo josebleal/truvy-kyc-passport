@@ -21,6 +21,14 @@ const { privateKey, publicKey } = generateKeyPairSync("rsa", {
 
 // ─── In-Memory Session Store ──────────────────────────────────────────────────
 const sessions = {};
+function calcAgeVerified(dob) {
+  if (!dob || String(dob).includes("*")) return "18+";
+  const d = new Date(dob);
+  if (isNaN(d.getTime())) return "18+";
+  const age = Math.floor((Date.now() - d) / (365.25*24*60*60*1000));
+  return age >= 21 ? "21+" : age >= 18 ? "18+" : "under18";
+}
+
 
 // ─── Anthropic Client ─────────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -80,7 +88,7 @@ app.post("/issue", async (req, res) => {
       country,
       documentType,
       sanctionsCheck: "PASSED",
-      ageVerified: "18+",
+      ageVerified: calcAgeVerified(req.body.dateOfBirth),
       issuer: "did:kycp:legitimuz",
       issuedAt: new Date().toISOString(),
     };
@@ -254,7 +262,7 @@ async function issueCredentialFromFields(extracted, res) {
     country: extracted.country || "Unknown",
     documentType: extracted.documentType || "identity_document",
     sanctionsCheck: "PASSED",
-    ageVerified: "18+",
+    ageVerified: calcAgeVerified(extracted.dateOfBirth),
     issuer: "did:kycp:legitimuz",
     issuedAt: new Date().toISOString(),
     extractionConfidence: extracted.confidence,
