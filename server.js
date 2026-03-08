@@ -176,8 +176,9 @@ async function extractFieldsFromImage(imageBase64, mimeType) {
 
 Return ONLY a valid JSON object — no other text:
 {
-  "name": "<full legal name as shown, or null if unreadable>",
-  "country": "<issuing country or US state, e.g. 'United States', 'Brazil'>",
+  ""name": "<full name in WESTERN ORDER — GIVEN NAME first, SURNAME last. Example: if document shows 'PALUDETTO DUTRA FELIPE', return 'Felipe Dutra Paludetto'>",
+  "state": "<issuing US state if this is a Driver's License, e.g. 'Florida' — null for passports>",
+  "country": "<issuing COUNTRY only — e.g. 'United States', 'Italy', 'Brazil' — never a state name>",
   "documentType": "<'passport' | 'drivers_license' | 'national_id'>",
   "documentNumber": "<ID number — show first 2 chars only then *******, e.g. 'AB*******'>",
   "dateOfBirth": "<return ONLY as '**/**/**** (age verified)', never the real date>",
@@ -216,8 +217,9 @@ ${rawText}
 
 Return ONLY a valid JSON object — no other text:
 {
-  "name": "<full legal name, or null if not found>",
-  "country": "<issuing country, e.g. 'United States', 'Brazil'>",
+    "name": "<full name in WESTERN ORDER — GIVEN NAME first, SURNAME last. Example: if document shows 'PALUDETTO DUTRA FELIPE', return 'Felipe Dutra Paludetto'>",
+    "state": "<issuing US state if this is a Driver's License, e.g. 'Florida' — null for passports>",
+  "country": "<issuing COUNTRY only — e.g. 'United States', 'Italy', 'Brazil' — never a state name>",
   "documentType": "<'passport' | 'drivers_license' | 'national_id'>",
   "documentNumber": "<ID number — first 2 chars + ******* only>",
   "dateOfBirth": "<return ONLY as '**/**/**** (age verified)'>",
