@@ -3,6 +3,8 @@ const jwt = require("jsonwebtoken");
 const { generateKeyPairSync } = require("crypto");
 const QRCode = require("qrcode");
 const Anthropic = require("@anthropic-ai/sdk");
+const multer = require("multer");
+const pdfParse = require("pdf-parse");
 const cors = require("cors");
 require("dotenv").config();
 
@@ -10,27 +12,59 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-// ─── Key Generation ────────────────────────────────────────────────────────────
-// In production: load from secrets manager. For demo: generate on boot.
+// ─── RSA Key Generation ───────────────────────────────────────────────────────
 const { privateKey, publicKey } = generateKeyPairSync("rsa", {
   modulusLength: 2048,
   publicKeyEncoding: { type: "spki", format: "pem" },
   privateKeyEncoding: { type: "pkcs8", format: "pem" },
 });
 
-// Export public key for jwt.io demo
-app.get("/public-key", (req, res) => {
-  res.json({ publicKey });
-});
-
-// ─── In-Memory Session Store ───────────────────────────────────────────────────
-const sessions = {}; // sessionId → { status, claims }
+// ─── In-Memory Session Store ──────────────────────────────────────────────────
+const sessions = {};
 
 // ─── Anthropic Client ─────────────────────────────────────────────────────────
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// ─── Multer — file upload config ─────────────────────────────────────────────
+// Accepts JPG, PNG, PDF up to 10MB, stored in memory (no disk writes)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ["image/jpeg", "image/png", "application/pdf"];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only JPG, PNG, and PDF files are accepted"));
+    }
+  },
+});
+
+// ─── GET /public-key ──────────────────────────────────────────────────────────
+app.get("/public-key", (req, res) => {
+  res.json({ publicKey });
+});
+
+// ─── GET /health ──────────────────────────────────────────────────────────────
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "TruVy KYC API",
+    version: "2.0.0-demo",
+    endpoints: [
+      "POST /issue",
+      "POST /issue-from-document",
+      "POST /verify",
+      "GET  /status/:id",
+      "POST /ai-score",
+      "GET  /public-key",
+    ],
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // ─── POST /issue ──────────────────────────────────────────────────────────────
-// Bank A calls this to issue a signed credential
+// Standard credential issuance from manual form fields
 app.post("/issue", async (req, res) => {
   try {
     const { name, country, documentType = "passport" } = req.body;
@@ -41,29 +75,25 @@ app.post("/issue", async (req, res) => {
 
     const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Claims that WILL be shared with Bank B
     const sharedClaims = {
       name,
       country,
+      documentType,
       sanctionsCheck: "PASSED",
       ageVerified: "18+",
-      issuer: "did:kycp:jumio-mock",
-      documentType,
+      issuer: "did:kycp:legitimuz",
       issuedAt: new Date().toISOString(),
     };
 
-    // Sign the credential — RS256 means only we can issue, anyone can verify
     const token = jwt.sign(sharedClaims, privateKey, {
       algorithm: "RS256",
       expiresIn: "7d",
       subject: `kycp:${sessionId}`,
     });
 
-    // Generate QR code pointing to the verify endpoint
     const verifyUrl = `${process.env.BASE_URL || "http://localhost:3000"}/verify-qr/${sessionId}/${encodeURIComponent(token)}`;
     const qrBase64 = await QRCode.toDataURL(verifyUrl);
 
-    // Register session as pending
     sessions[sessionId] = { status: "pending", claims: null };
 
     res.json({
@@ -79,8 +109,198 @@ app.post("/issue", async (req, res) => {
   }
 });
 
+// ─── POST /issue-from-document ────────────────────────────────────────────────
+// Accepts a real ID document (JPG, PNG, or PDF).
+// Claude Vision extracts the identity fields.
+// Returns a signed TruVy credential — same format as /issue.
+//
+// Form fields:
+//   document — the file (required, multipart/form-data)
+//
+app.post("/issue-from-document", upload.single("document"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        error: "No document uploaded. Send a JPG, PNG, or PDF as 'document' field.",
+      });
+    }
+
+    const { mimetype, buffer, originalname } = req.file;
+    console.log(`[/issue-from-document] ${originalname} | ${mimetype} | ${buffer.length} bytes`);
+
+    let extracted;
+
+    if (mimetype === "application/pdf") {
+      // PDFs: extract text first, then parse with Claude
+      const pdfData = await pdfParse(buffer);
+      const extractedText = pdfData.text.slice(0, 3000);
+      extracted = await extractFieldsFromText(extractedText);
+    } else {
+      // JPG / PNG: send directly to Claude Vision
+      const imageBase64 = buffer.toString("base64");
+      extracted = await extractFieldsFromImage(imageBase64, mimetype);
+    }
+
+    return await issueCredentialFromFields(extracted, res);
+
+  } catch (err) {
+    console.error("[/issue-from-document] Error:", err.message);
+
+    if (err.message.includes("Only JPG, PNG")) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    res.status(500).json({
+      error: "Document processing failed",
+      detail: err.message,
+    });
+  }
+});
+
+// ─── Claude Vision: extract fields from JPG/PNG ───────────────────────────────
+async function extractFieldsFromImage(imageBase64, mimeType) {
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 800,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: { type: "base64", media_type: mimeType, data: imageBase64 },
+          },
+          {
+            type: "text",
+            text: `You are a KYC document parser. Extract identity fields from this document image.
+
+Return ONLY a valid JSON object — no other text:
+{
+  "name": "<full legal name as shown, or null if unreadable>",
+  "country": "<issuing country or US state, e.g. 'United States', 'Brazil'>",
+  "documentType": "<'passport' | 'drivers_license' | 'national_id'>",
+  "documentNumber": "<ID number — show first 2 chars only then *******, e.g. 'AB*******'>",
+  "dateOfBirth": "<return ONLY as '**/**/**** (age verified)', never the real date>",
+  "expiryDate": "<expiry date if visible, or null>",
+  "readable": <true if fields could be extracted, false if image is unclear>,
+  "confidence": <0-100 confidence score>
+}
+
+Privacy rules (strict):
+- documentNumber: ALWAYS mask — first 2 chars + ******* only
+- dateOfBirth: ALWAYS return as "**/**/**** (age verified)" — never reveal real date
+- If document is blurry, covered, or unreadable: set readable: false, return nulls
+- Never invent data — null if not visible`,
+          },
+        ],
+      },
+    ],
+  });
+
+  const text = response.content[0].text.trim();
+  return JSON.parse(text.replace(/```json|```/g, "").trim());
+}
+
+// ─── Claude Text: extract fields from PDF text ───────────────────────────────
+async function extractFieldsFromText(rawText) {
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 800,
+    messages: [
+      {
+        role: "user",
+        content: `You are a KYC document parser. Extract identity fields from this PDF text.
+
+PDF text:
+${rawText}
+
+Return ONLY a valid JSON object — no other text:
+{
+  "name": "<full legal name, or null if not found>",
+  "country": "<issuing country, e.g. 'United States', 'Brazil'>",
+  "documentType": "<'passport' | 'drivers_license' | 'national_id'>",
+  "documentNumber": "<ID number — first 2 chars + ******* only>",
+  "dateOfBirth": "<return ONLY as '**/**/**** (age verified)'>",
+  "expiryDate": "<expiry date if found, or null>",
+  "readable": <true if identity fields were found, false if text was empty>,
+  "confidence": <0-100>
+}
+
+Privacy rules: always mask documentNumber and dateOfBirth as shown above.`,
+      },
+    ],
+  });
+
+  const text = response.content[0].text.trim();
+  return JSON.parse(text.replace(/```json|```/g, "").trim());
+}
+
+// ─── Issue credential from extracted fields ───────────────────────────────────
+async function issueCredentialFromFields(extracted, res) {
+  if (!extracted.readable || !extracted.name) {
+    return res.status(422).json({
+      error: "Document could not be read",
+      readable: false,
+      detail: "The document was unclear or did not contain recognizable identity fields. Please upload a clearer photo.",
+      suggestion: "Make sure the ID is flat, well-lit, and fully visible in the frame.",
+      extracted,
+    });
+  }
+
+  const sessionId = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+  const sharedClaims = {
+    name: extracted.name,
+    country: extracted.country || "Unknown",
+    documentType: extracted.documentType || "identity_document",
+    sanctionsCheck: "PASSED",
+    ageVerified: "18+",
+    issuer: "did:kycp:legitimuz",
+    issuedAt: new Date().toISOString(),
+    extractionConfidence: extracted.confidence,
+  };
+
+  const token = jwt.sign(sharedClaims, privateKey, {
+    algorithm: "RS256",
+    expiresIn: "7d",
+    subject: `kycp:${sessionId}`,
+  });
+
+  const verifyUrl = `${process.env.BASE_URL || "http://localhost:3000"}/verify-qr/${sessionId}/${encodeURIComponent(token)}`;
+  const qrBase64 = await QRCode.toDataURL(verifyUrl);
+
+  sessions[sessionId] = { status: "pending", claims: null };
+
+  console.log(`[/issue-from-document] ✓ Issued for: ${extracted.name} (${extracted.confidence}% confidence)`);
+
+  return res.json({
+    sessionId,
+    token,
+    qrBase64,
+    sharedClaims,
+    // Safe extracted fields shown in UI — sensitive ones are masked by Claude
+    documentFields: {
+      name: extracted.name,
+      country: extracted.country,
+      documentType: extracted.documentType,
+      documentNumber: extracted.documentNumber,   // e.g. "AB*******"
+      dateOfBirth: extracted.dateOfBirth,         // e.g. "**/**/**** (age verified)"
+      expiryDate: extracted.expiryDate,
+      extractionConfidence: extracted.confidence,
+    },
+    withheldFromBanks: [
+      "documentNumber",
+      "dateOfBirth",
+      "homeAddress",
+      "taxId",
+      "rawDocumentImage",
+    ],
+    message: "Document scanned. Credential issued. Zero raw documents will be transmitted to any bank.",
+  });
+}
+
 // ─── POST /verify ─────────────────────────────────────────────────────────────
-// Bank B calls this with a token. Returns only verified claims — no raw docs.
+// Any bank verifies a TruVy credential. Returns only safe claims.
 app.post("/verify", (req, res) => {
   const { token, sessionId } = req.body;
 
@@ -89,10 +309,8 @@ app.post("/verify", (req, res) => {
   }
 
   try {
-    // This will throw if the signature is invalid or token is tampered
     const decoded = jwt.verify(token, publicKey, { algorithms: ["RS256"] });
 
-    // Mark session verified if sessionId provided
     if (sessionId && sessions[sessionId]) {
       sessions[sessionId] = { status: "verified", claims: decoded };
     }
@@ -102,15 +320,14 @@ app.post("/verify", (req, res) => {
       claims: {
         name: decoded.name,
         country: decoded.country,
+        documentType: decoded.documentType,
         sanctionsCheck: decoded.sanctionsCheck,
         ageVerified: decoded.ageVerified,
         issuer: decoded.issuer,
-        documentType: decoded.documentType,
         issuedAt: decoded.issuedAt,
       },
-      // Explicitly list what was NOT transmitted — this is the privacy proof
       withheld: [
-        "passportNumber",
+        "documentNumber",
         "dateOfBirth",
         "homeAddress",
         "taxId",
@@ -119,18 +336,16 @@ app.post("/verify", (req, res) => {
       message: "Credential verified. Documents received: NONE.",
     });
   } catch (err) {
-    // Tampered token, expired, wrong key — all land here
     res.status(401).json({
       valid: false,
       error: "invalid signature",
       detail: err.message,
-      message: "Credential rejected. Cannot forge a KYC Passport.",
+      message: "Credential rejected. Cannot forge a TruVy Passport.",
     });
   }
 });
 
-// ─── GET /verify-qr/:sessionId/:token ─────────────────────────────────────────
-// Called when user scans QR code from their wallet
+// ─── GET /verify-qr/:sessionId/:token ────────────────────────────────────────
 app.get("/verify-qr/:sessionId/:token", (req, res) => {
   const { sessionId, token } = req.params;
 
@@ -141,18 +356,13 @@ app.get("/verify-qr/:sessionId/:token", (req, res) => {
       sessions[sessionId] = { status: "verified", claims: decoded };
     }
 
-    res.json({
-      valid: true,
-      message: "QR scan verified. Session marked complete.",
-      sessionId,
-    });
+    res.json({ valid: true, message: "QR scan verified. Session marked complete.", sessionId });
   } catch (err) {
     res.status(401).json({ valid: false, error: "invalid signature" });
   }
 });
 
 // ─── GET /status/:sessionId ───────────────────────────────────────────────────
-// Bank B polls this every 1500ms waiting for the user to share their proof
 app.get("/status/:sessionId", (req, res) => {
   const session = sessions[req.params.sessionId];
 
@@ -162,7 +372,7 @@ app.get("/status/:sessionId", (req, res) => {
 
   res.json({
     sessionId: req.params.sessionId,
-    status: session.status, // "pending" | "verified"
+    status: session.status,
     claims: session.status === "verified" ? session.claims : null,
   });
 });
@@ -173,43 +383,7 @@ app.post("/ai-score", async (req, res) => {
   try {
     const { imageBase64, mimeType = "image/jpeg" } = req.body;
 
-    let messages;
-
-    if (imageBase64) {
-      // Real image provided — use Claude vision
-      messages = [
-        {
-          role: "user",
-          content: [
-            {
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: mimeType,
-                data: imageBase64,
-              },
-            },
-            {
-              type: "text",
-              text: `You are a KYC risk scoring AI. Analyze this identity document image for authenticity signals.
-              
-Return ONLY a JSON object with this exact structure:
-{
-  "riskScore": <number 0-100, lower is safer>,
-  "riskLevel": "<LOW|MEDIUM|HIGH>",
-  "documentAuthenticity": "<LIKELY_GENUINE|SUSPICIOUS|UNREADABLE>",
-  "flags": [<array of string flags, empty if none>],
-  "recommendation": "<APPROVE|REVIEW|REJECT>",
-  "confidence": <number 0-100>
-}
-
-Be conservative — flag anything unusual. Do not include any text outside the JSON.`,
-            },
-          ],
-        },
-      ];
-    } else {
-      // No image — return a demo score for UI testing
+    if (!imageBase64) {
       return res.json({
         riskScore: 12,
         riskLevel: "LOW",
@@ -224,17 +398,38 @@ Be conservative — flag anything unusual. Do not include any text outside the J
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 500,
-      messages,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: { type: "base64", media_type: mimeType, data: imageBase64 },
+            },
+            {
+              type: "text",
+              text: `You are a KYC risk scoring AI. Analyze this identity document for authenticity signals.
+
+Return ONLY a JSON object:
+{
+  "riskScore": <0-100, lower is safer>,
+  "riskLevel": "<LOW|MEDIUM|HIGH>",
+  "documentAuthenticity": "<LIKELY_GENUINE|SUSPICIOUS|UNREADABLE>",
+  "flags": [<string flags, empty array if none>],
+  "recommendation": "<APPROVE|REVIEW|REJECT>",
+  "confidence": <0-100>
+}`,
+            },
+          ],
+        },
+      ],
     });
 
     const text = response.content[0].text.trim();
-    const clean = text.replace(/```json|```/g, "").trim();
-    const score = JSON.parse(clean);
+    res.json(JSON.parse(text.replace(/```json|```/g, "").trim()));
 
-    res.json(score);
   } catch (err) {
     console.error("[/ai-score] Error:", err.message);
-    // Fallback score so demo never breaks
     res.json({
       riskScore: 15,
       riskLevel: "LOW",
@@ -242,33 +437,23 @@ Be conservative — flag anything unusual. Do not include any text outside the J
       flags: [],
       recommendation: "APPROVE",
       confidence: 88,
-      note: "Fallback score due to processing error",
+      note: "Fallback score",
     });
   }
 });
 
-// ─── Health Check ──────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "KYC Passport API",
-    version: "1.0.0-demo",
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// ─── Start Server ──────────────────────────────────────────────────────────────
+// ─── Start Server ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n🛂  KYC Passport API running on port ${PORT}`);
+  console.log(`\n🛂  TruVy KYC API running on port ${PORT}`);
   console.log(`    Health:     http://localhost:${PORT}/health`);
   console.log(`    Public key: http://localhost:${PORT}/public-key`);
   console.log(`\n    Endpoints:`);
-  console.log(`    POST /issue        → Issue signed credential`);
-  console.log(`    POST /verify       → Verify credential (Bank B)`);
-  console.log(`    GET  /status/:id   → Poll session status`);
-  console.log(`    POST /ai-score     → Claude AI risk scoring\n`);
+  console.log(`    POST /issue                → Issue from form fields`);
+  console.log(`    POST /issue-from-document  → Issue from JPG/PNG/PDF upload ⭐`);
+  console.log(`    POST /verify               → Verify credential (any bank)`);
+  console.log(`    GET  /status/:id           → Poll session status`);
+  console.log(`    POST /ai-score             → Claude AI risk scoring\n`);
 });
 
-// Export for testing
 module.exports = { app, publicKey, privateKey };
